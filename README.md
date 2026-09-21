@@ -1,158 +1,66 @@
-# Log Normalizer Service — Coding Exercise
+# Log Normalizer Service
 
-A backend coding exercise for Data Integration Engineers. Build a small TCP server that accepts logs in two formats, parses them, and outputs normalized records. This exercise assesses data source wiring, schema mapping, and systems thinking relevant to log ingestion pipelines.
+A TCP service that accepts RFC 3164 syslog (including CEF) and NDJSON Windows Event Log records, and emits one normalized NDJSON record per input line using the schema in [SCHEMA.md](SCHEMA.md).
 
-**Time estimate:** 2–3 hours
-
----
-
-## Overview
-
-Build a **Log Normalizer Service** that:
-
-1. Listens on a TCP port for incoming log messages
-2. Accepts two input formats: **RFC 3164 syslog** and **NDJSON** (structured events, similar to Windows Event Log)
-3. Detects the format of each incoming message
-4. Parses and maps the data to a **normalized schema** (see [SCHEMA.md](SCHEMA.md))
-5. Outputs one NDJSON record per input to stdout or a configurable sink
-
-### Architecture
+**Requirements:** Python 3.11+ (developed on 3.14). No runtime dependencies; pytest for the tests.
 
 ```
-┌─────────────────┐     ┌─────────────────┐
-│ RFC 3164 Syslog │     │  NDJSON (JSON)  │
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-         └───────────┬───────────┘
-                     ▼
-            ┌────────────────┐
-            │  TCP Server    │  (e.g., port 5044)
-            │  Listen + Read  │
-            └────────┬───────┘
-                     ▼
-            ┌────────────────┐
-            │ Format Detector│  (per line or per connection)
-            │ + Parser       │
-            └────────┬───────┘
-                     ▼
-            ┌────────────────┐
-            │ Schema Mapper   │  (map to normalized fields)
-            └────────┬───────┘
-                     ▼
-            ┌────────────────┐
-            │ NDJSON Output   │  (stdout or configurable)
-            └────────────────┘
+lognorm/normalize.py   # format detection, parsing, schema mapping: normalize(line) -> dict
+lognorm/server.py      # asyncio TCP listener that calls normalize() on each line
+tests/test_samples.py
 ```
 
----
+## Running
 
-## Requirements
+```bash
+python3 -m venv .venv && source .venv/bin/activate
 
-| Requirement | Description |
-|-------------|-------------|
-| **TCP listener** | Listen on a configurable TCP port (default: 5044) |
-| **Two input formats** | Accept RFC 3164 syslog and NDJSON (one JSON object per line) |
-| **Format detection** | Detect format per connection or per line. Document your choice and rationale. |
-| **Schema mapping** | Map all parsed fields to the normalized schema in `SCHEMA.md` |
-| **Output** | Emit one NDJSON record per input to stdout or a configurable sink (e.g., file) |
-| **Error handling** | Handle malformed input without crashing. Log or emit errors appropriately. |
+python -m lognorm.server                        # 127.0.0.1:5044, NDJSON to stdout
+python -m lognorm.server --port 6000            # custom port
+python -m lognorm.server --host 0.0.0.0         # accept connections from other machines
+python -m lognorm.server --output out.ndjson    # append records to a file instead
+```
 
----
+Records go to stdout (or `--output`). Connection logs and errors go to stderr, so stdout stays valid NDJSON.
 
-## Sample Data
+In a second terminal:
 
-Sample input files are provided for testing. **Each file contains one message.** When sending over TCP, send one message per line. For syslog, each sample is a single line. For JSON, minify to one line per event (e.g., `jq -c . samples/json/sample-1.json`) so each TCP line carries one complete JSON object.
+```bash
+cat samples/syslog/*.log | nc -w 1 localhost 5044
+jq -c . samples/json/sample-1.json | nc -w 1 localhost 5044      # JSON must be one object per line
+printf '{not json\n<134>truncated\n' | nc -w 1 localhost 5044    # malformed input -> error records
+```
 
-### `samples/syslog/`
+## Testing
 
-| File | Description |
-|------|-------------|
-| `sample-1.log` | Auth success — RFC 3164 syslog with CEF message (successful logon) |
-| `sample-2.log` | Auth failure — RFC 3164 syslog with CEF message (failed logon) |
-| `sample-3.log` | Network event — RFC 3164 syslog with CEF message (traffic allowed) |
+```bash
+pip install pytest
+python -m pytest -v
+```
 
-### `samples/json/`
+The tests call `normalize()` directly on the sample files; no server is needed. JSON samples 1 and 2 are compared against `expected/sample-output.ndjson`.
 
-| File | Description |
-|------|-------------|
-| `sample-1.json` | Windows Event 4624 — logon success (nested `System`, `EventData`, `RenderingInfo`) |
-| `sample-2.json` | Windows Event 4625 — logon failure |
-| `sample-3.json` | Windows Event 4688 — process creation |
+## Format detection: per line
 
-Each JSON sample uses a Windows Event Log–like structure with nested objects. Your mapper must extract fields from these nested paths.
+Each line is classified on its own: if the first non-whitespace character is `{`, it's parsed as JSON; otherwise it's parsed as syslog.
 
----
+I chose per-line over per-connection because one TCP connection from a forwarder can carry logs from several sources in different formats. The check costs a single character comparison, and a malformed line only affects itself, not everything else on the connection.
 
-## Acceptance Criteria
+## Assumptions and trade-offs
 
-Your solution should:
+- **Syslog timestamps** have no year or timezone. The current year is assumed, moving back a year if the result would be more than a day in the future, and the timezone is assumed to be UTC. JSON timestamps with no timezone are also treated as UTC. All output is ISO 8601 UTC with milliseconds.
+- **`event.type` for syslog follows the spec's rule order,** so CEF `act=` is checked before authentication keywords. As a result, a logon arriving as CEF with `act=allow` maps to `allowed`, while the same Windows event 4624 arriving as JSON maps to `start`.
+- **`log.level` uses syslog PRI severity (`PRI % 8`), not CEF severity.** The spec's example mapping (6 → info, 4 → warning, 3 → error) matches the syslog scale, and the CEF 0–10 scale runs the other way (higher means more severe). Severity 5 is kept as `notice`.
+- **Keyword matching goes beyond the spec's word lists where the samples need it:** "logged on" and "log on" count as authentication, "denied" as failure, and failure words are checked before success words because "unsuccessful" contains "success".
+- **`source.ip` for JSON** uses `EventData.IpAddress` and falls back to `OpenWEC.IpAddress`, as the spec says. The OpenWEC value is the collector's address, not the event's origin.
+- **Missing values:** `-`, empty strings and whitespace-only strings in optional fields become `null`. Fields are output as `null` rather than left out, so every record has the same keys. The spec's `S-1-0-0` rule doesn't apply here, because the schema has no SID field.
+- **Malformed input never crashes the service.** A line that can't be parsed becomes an error record: category `host`, outcome `unknown`, the original line as `message`, and an `error` field saying what failed.
+- **TCP:** one coroutine per connection. Lines longer than 1 MiB are dropped with a warning, so a sender that never sends a newline can't make the server buffer indefinitely.
 
-- [ ] Parse RFC 3164 syslog: priority, timestamp, hostname, and message
-- [ ] Parse CEF extensions when present (e.g., `src=`, `suser=`, `act=`) in syslog
-- [ ] Parse NDJSON: one JSON object per line
-- [ ] Extract `@timestamp` from both formats (syslog timestamp or `System.TimeCreated` / equivalent)
-- [ ] Extract `user.name` from both formats (e.g., CEF `suser`, JSON `EventData.TargetUserName`)
-- [ ] Extract `source.ip` when available
-- [ ] Map `event.category` and `event.outcome` using the rules in `SCHEMA.md`
-- [ ] Handle malformed input without crashing (e.g., invalid JSON, truncated syslog)
-- [ ] Output valid NDJSON (one record per line)
+## With more time
 
----
-
-## What We're Evaluating
-
-| Criterion | What we look for |
-|-----------|------------------|
-| **Data mapping logic** | Correct nested field extraction; conditional categorization (event type, outcome); handling of `-` or empty values |
-| **Format detection** | Clear strategy (e.g., first character `{` → JSON); rationale for per-line vs per-connection detection |
-| **Systems awareness** | TCP handling; graceful degradation on bad input; consideration of batching, backpressure, or connection limits |
-| **Code organization** | Readable, organized, testable structure |
-| **AI usage disclosure** | `AI_USAGE.md` present and honest (see below) |
-
----
-
-## Language & Scope
-
-- **Language:** Any (Go, Python, Node, Rust, etc.)
-- **Time:** 2–3 hours. Prioritize: (1) parsing both formats, (2) schema mapping, (3) systems considerations.
-- **Tradeoffs:** If time is short, focus on mapping accuracy over batching or advanced TCP behavior. Document what you would do with more time.
-
----
-
-## AI Usage
-
-Use of AI tools (e.g., ChatGPT, Copilot, Cursor) is **allowed**. We want to see how you work with these tools.
-
-Please document your usage in `AI_USAGE.md`:
-
-- What tools you used
-- What you used them for (e.g., boilerplate, parsing logic, debugging)
-- What you wrote yourself vs. generated
-
-Honest disclosure is required. We evaluate your integration and mapping choices, not whether you used AI.
-
----
-
-## Expected Output
-
-See `expected/sample-output.ndjson` for example normalized records. Use these to validate your mapper output format and field values.
-
----
-
-## Getting Started
-
-1. Read [SCHEMA.md](SCHEMA.md) for the target schema and mapping rules
-2. Review the sample files in `samples/syslog/` and `samples/json/`
-3. Implement the service
-4. Test with the sample data (e.g., `nc` or a small script to send samples over TCP). Syslog samples are single-line; for JSON, send one minified object per line
-5. Create `AI_USAGE.md` before submitting
-
----
-
-## Submission
-
-When complete, ensure your repository includes:
-
-- Implementation code
-- Brief README or instructions on how to run and test
-- `AI_USAGE.md` with your AI usage disclosure
+- Cap the number of concurrent connections, and close idle ones.
+- Write records through a queue with batched writes and a real sink, instead of flushing to stdout one record at a time. At the moment a slow consumer stalls every connection.
+- Support RFC 5424 syslog, octet-counted TCP framing (RFC 6587), and CEF escape sequences (`\|`, `\=`).
+- Make syslog timezone and severity source configurable per sender, and move the EventID mappings into configuration.
+- Keep the original line in an `event.original` field, and add metrics for records processed, error records and dropped lines.
